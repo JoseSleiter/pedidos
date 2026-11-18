@@ -1,0 +1,160 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Enums (máquinas de estado) ───────────────────────────────
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAYMENT_FAILED
+  PAID
+  READY_TO_SHIP
+  SHIPPED
+  DELIVERED
+  DELIVERY_FAILED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  INITIALIZED // transacción creada en Webpay, el usuario aún no vuelve
+  COMMITTING // una request "ganó" el derecho a hacer commit
+  AUTHORIZED
+  REJECTED
+  UNKNOWN // timeout en el commit: no sabemos si se cobró → conciliación
+  ABORTED // el usuario anuló en el formulario de Webpay
+  EXPIRED
+  REFUNDED
+}
+
+enum ShipmentStatus {
+  PENDING
+  CREATED
+  IN_TRANSIT
+  DELIVERED
+  FAILED
+}
+
+// ─────────────────────────────── Catálogo ───────────────────────────────
+
+model Product {
+  id    String @id @default(uuid())
+  sku   String @unique
+  name  String
+  price Int // CLP, sin decimales (Webpay trabaja con montos enteros)
+  stock Int
+
+  items OrderItem[]
+}
+
+// ─────────────────────────────── Pedidos ───────────────────────────────
+
+model Order {
+  id              String      @id @default(uuid())
+  status          OrderStatus @default(PENDING_PAYMENT)
+  total           Int
+  currency        String      @default("CLP")
+  customerEmail   String
+  shippingAddress String
+  paymentDeadline DateTime
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  items    OrderItem[]
+  payments Payment[]
+  shipment Shipment?
+
+  @@index([status, paymentDeadline]) // para el cron de expiración (fase 4)
+}
+
+model OrderItem {
+  id        String @id @default(uuid())
+  orderId   String
+  productId String
+  quantity  Int
+  unitPrice Int // precio congelado al momento de comprar
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+}
+
+// ─────────────────────────────── Pagos ───────────────────────────────
+
+model Payment {
+  id                String        @id @default(uuid())
+  orderId           String
+  attempt           Int // 1, 2, 3... un intento por transacción Webpay
+  buyOrder          String        @unique // lo que enviamos a Transbank; único por transacción
+  sessionId         String
+  token             String?       @unique // lo devuelve Transbank al crear
+  amount            Int
+  status            PaymentStatus @default(INITIALIZED)
+  authorizationCode String?
+  responseCode      Int?
+  rawResponse       Json?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@unique([orderId, attempt])
+  @@index([status, updatedAt]) // para conciliación (fase 4)
+}
+
+// ─────────────────────────────── Despacho ───────────────────────────────
+
+model Shipment {
+  id           String         @id @default(uuid())
+  orderId      String         @unique // máximo un despacho por pedido → idempotencia
+  status       ShipmentStatus @default(PENDING)
+  courierRef   String?
+  trackingCode String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+// ─────────────────────────────── Infraestructura de confiabilidad ───────────────────────────────
+
+// Guarda la respuesta de cada request idempotente para poder repetirla tal cual.
+model IdempotencyRecord {
+  id             String   @id @default(uuid())
+  scope          String // ej. "POST /orders"
+  key            String // header Idempotency-Key que manda el cliente
+  requestHash    String // sha256 del body: detecta reuso de la key con otro body
+  responseStatus Int?
+  responseBody   Json?
+  createdAt      DateTime @default(now())
+
+  @@unique([scope, key])
+}
+
+// Patrón outbox: el evento se guarda en la MISMA transacción que el cambio de estado (fase 3).
+model OutboxEvent {
+  id          String    @id @default(uuid())
+  type        String
+  payload     Json
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([processedAt, createdAt])
+}
+
+// Dedupe de webhooks entrantes (courier) por id de evento (fase 3).
+model ProcessedWebhook {
+  id         String   @id @default(uuid())
+  source     String
+  eventId    String
+  receivedAt DateTime @default(now())
+
+  @@unique([source, eventId])
+}

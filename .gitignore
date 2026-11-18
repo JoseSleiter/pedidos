@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Secretos y configuración local: el .env.example SI va versionado.
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
